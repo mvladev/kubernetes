@@ -42,6 +42,7 @@ go_test(
     srcs = [
         "globalflags_test.go",
         "options_test.go",
+        "validation_test.go",
     ],
     embed = [":go_default_library"],
     deps = [
@@ -51,6 +52,7 @@ go_test(
         "//pkg/kubelet/client:go_default_library",
         "//pkg/master/reconcilers:go_default_library",
         "//staging/src/k8s.io/apimachinery/pkg/util/diff:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/util/net:go_default_library",
         "//staging/src/k8s.io/apiserver/pkg/server/options:go_default_library",
         "//staging/src/k8s.io/apiserver/pkg/storage/storagebackend:go_default_library",
         "//staging/src/k8s.io/apiserver/pkg/util/flag:go_default_library",
@@ -59,6 +61,7 @@ go_test(
         "//staging/src/k8s.io/apiserver/plugin/pkg/audit/truncate:go_default_library",
         "//staging/src/k8s.io/client-go/rest:go_default_library",
         "//vendor/github.com/spf13/pflag:go_default_library",
+        "//vendor/github.com/stretchr/testify/assert:go_default_library",
     ],
 )
 

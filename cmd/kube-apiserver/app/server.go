@@ -342,7 +342,7 @@ func CreateKubeAPIServerConfig(
 
 			ServiceIPRange:       serviceIPRange,
 			APIServerServiceIP:   apiServerServiceIP,
-			APIServerServicePort: 443,
+			APIServerServicePort: s.KubernetesServicePort,
 
 			ServiceNodePortRange:      s.ServiceNodePortRange,
 			KubernetesServiceNodePort: s.KubernetesServiceNodePort,

@@ -108,6 +108,7 @@ func TestAddFlags(t *testing.T) {
 		"--kubelet-client-certificate=/var/run/kubernetes/ceserver.crt",
 		"--kubelet-client-key=/var/run/kubernetes/server.key",
 		"--kubelet-certificate-authority=/var/run/kubernetes/caserver.crt",
+		"--kubernetes-service-port=8443",
 		"--proxy-client-cert-file=/var/run/kubernetes/proxy.crt",
 		"--proxy-client-key-file=/var/run/kubernetes/proxy.key",
 		"--request-timeout=2m",
@@ -117,6 +118,7 @@ func TestAddFlags(t *testing.T) {
 
 	// This is a snapshot of expected options parsed by args.
 	expected := &ServerRunOptions{
+		KubernetesServicePort:  8443,
 		ServiceNodePortRange:   kubeoptions.DefaultServiceNodePortRange,
 		ServiceClusterIPRange:  kubeoptions.DefaultServiceIPCIDR,
 		MasterCount:            5,

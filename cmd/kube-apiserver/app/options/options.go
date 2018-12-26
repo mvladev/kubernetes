@@ -55,6 +55,7 @@ type ServerRunOptions struct {
 	EventTTL                  time.Duration
 	KubeletConfig             kubeletclient.KubeletClientConfig
 	KubernetesServiceNodePort int
+	KubernetesServicePort     int
 	MaxConnectionBytesPerSec  int64
 	ServiceClusterIPRange     net.IPNet // TODO: make this a list
 	ServiceNodePortRange      utilnet.PortRange
@@ -112,7 +113,8 @@ func NewServerRunOptions() *ServerRunOptions {
 			EnableHttps: true,
 			HTTPTimeout: time.Duration(5) * time.Second,
 		},
-		ServiceNodePortRange: kubeoptions.DefaultServiceNodePortRange,
+		ServiceNodePortRange:  kubeoptions.DefaultServiceNodePortRange,
+		KubernetesServicePort: 443,
 	}
 	s.ServiceClusterIPRange = kubeoptions.DefaultServiceIPCIDR
 
@@ -177,6 +179,9 @@ func (s *ServerRunOptions) Flags() (fss apiserverflag.NamedFlagSets) {
 		"If non-zero, the Kubernetes master service (which apiserver creates/maintains) will be "+
 		"of type NodePort, using this as the value of the port. If zero, the Kubernetes master "+
 		"service will be of type ClusterIP.")
+
+	fs.IntVar(&s.KubernetesServicePort, "kubernetes-service-port", s.KubernetesServicePort, ""+
+		"The service port of the Kubernetes master service (which apiserver creates/maintains).")
 
 	fs.IPNetVar(&s.ServiceClusterIPRange, "service-cluster-ip-range", s.ServiceClusterIPRange, ""+
 		"A CIDR notation IP range from which to assign service cluster IPs. This must not "+
