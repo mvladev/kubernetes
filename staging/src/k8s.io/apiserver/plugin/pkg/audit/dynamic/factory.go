@@ -38,6 +38,7 @@ type factory struct {
 	config               *Config
 	webhookClientManager webhook.ClientManager
 	sink                 *auditregv1alpha1.AuditSink
+	auditClasses         []*auditregv1alpha1.AuditClass
 }
 
 // BuildDelegate creates a delegate from the AuditSink object
@@ -67,7 +68,15 @@ func (f *factory) buildWebhookBackend() (audit.Backend, error) {
 }
 
 func (f *factory) applyEnforcedOpts(delegate audit.Backend) audit.Backend {
-	pol := policy.ConvertDynamicPolicyToInternal(&f.sink.Spec.Policy)
+	auditClassesMap := make(map[string][]auditregv1alpha1.RequestSelector)
+	// quick heads up if this policy cares about AuditClasses at all
+	if len(f.sink.Spec.Policy.Rules) > 0 {
+		// build an index of all request selectors by their AuditClass owner name
+		for _, auditClass := range f.auditClasses {
+			auditClassesMap[auditClass.GetName()] = auditClass.Spec.RequestSelectors
+		}
+	}
+	pol := policy.ConvertDynamicPolicyToInternal(&f.sink.Spec.Policy, auditClassesMap)
 	checker := policy.NewChecker(pol)
 	eb := enforcedplugin.NewBackend(delegate, checker)
 	return eb

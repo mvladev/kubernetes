@@ -18,17 +18,22 @@ package dynamic
 
 import (
 	"fmt"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"k8s.io/klog"
 
 	auditregv1alpha1 "k8s.io/api/auditregistration/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	auditinternal "k8s.io/apiserver/pkg/apis/audit"
 	auditinstall "k8s.io/apiserver/pkg/apis/audit/install"
 	auditv1 "k8s.io/apiserver/pkg/apis/audit/v1"
@@ -36,8 +41,10 @@ import (
 	webhook "k8s.io/apiserver/pkg/util/webhook"
 	bufferedplugin "k8s.io/apiserver/plugin/pkg/audit/buffered"
 	auditinformer "k8s.io/client-go/informers/auditregistration/v1alpha1"
+	auditlisters "k8s.io/client-go/listers/auditregistration/v1alpha1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 )
 
 // PluginName is the name reported in error metrics.
@@ -45,8 +52,12 @@ const PluginName = "dynamic"
 
 // Config holds the configuration for the dynamic backend
 type Config struct {
-	// Informer for the audit sinks
-	Informer auditinformer.AuditSinkInformer
+	// AuditSinkInformer is informer for AuditSink resources
+	AuditSinkInformer auditinformer.AuditSinkInformer
+	// AuditClassInformer is informer for AuditClass resources
+	AuditClassInformer auditinformer.AuditClassInformer
+	// WorkersCount is the number of workque workers keeping AuditSynk delegates in sync with AuditSink and AudtiClass resources
+	WorkersCount int
 	// EventConfig holds the configuration for event notifications about the AuditSink API objects
 	EventConfig EventConfig
 	// BufferedConfig is the runtime buffered configuration
@@ -118,41 +129,19 @@ func NewBackend(c *Config) (audit.Backend, error) {
 	cm.SetServiceResolver(c.WebhookConfig.ServiceResolver)
 	cm.SetAuthenticationInfoResolverWrapper(c.WebhookConfig.AuthInfoResolverWrapper)
 
-	manager := &backend{
+	b := &backend{
 		config:               c,
 		delegates:            atomic.Value{},
 		delegateUpdateMutex:  sync.Mutex{},
 		webhookClientManager: cm,
 		recorder:             recorder,
 	}
-	manager.delegates.Store(syncedDelegates{})
 
-	c.Informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			manager.addSink(obj.(*auditregv1alpha1.AuditSink))
-		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			manager.updateSink(oldObj.(*auditregv1alpha1.AuditSink), newObj.(*auditregv1alpha1.AuditSink))
-		},
-		DeleteFunc: func(obj interface{}) {
-			sink, ok := obj.(*auditregv1alpha1.AuditSink)
-			if !ok {
-				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-				if !ok {
-					klog.V(2).Infof("Couldn't get object from tombstone %#v", obj)
-					return
-				}
-				sink, ok = tombstone.Obj.(*auditregv1alpha1.AuditSink)
-				if !ok {
-					klog.V(2).Infof("Tombstone contained object that is not an AuditSink: %#v", obj)
-					return
-				}
-			}
-			manager.deleteSink(sink)
-		},
-	})
+	b.auditSinkControler = newAuditSinkControler(c.AuditSinkInformer, c.AuditClassInformer, c.WorkersCount, b)
 
-	return manager, nil
+	b.delegates.Store(syncedDelegates{})
+
+	return b, nil
 }
 
 type backend struct {
@@ -162,6 +151,14 @@ type backend struct {
 	delegates            atomic.Value
 	webhookClientManager webhook.ClientManager
 	recorder             record.EventRecorder
+	auditSinkControler   runner
+}
+
+// delegateManager defines the operations applicable to delegates that
+// are exposed to the AuditSink controller.
+type delegateManager interface {
+	registerAndRunNewDelegate(sink *auditregv1alpha1.AuditSink) error
+	unregisterAndStopDelegate(uid types.UID)
 }
 
 type syncedDelegates map[types.UID]*delegate
@@ -185,10 +182,22 @@ func (b *backend) ProcessEvents(events ...*auditinternal.Event) bool {
 	return true
 }
 
-// Run starts a goroutine that propagates the shutdown signal,
-// individual delegates are ran as they are created.
+// Run starts the asynchronous processing of the workqueue for delegates
+// synchronization events that will proceed until a shutdown signal is received.
+// Individual delegates are started as they are created and are shutdown
+// upon the same shutdown signal.
 func (b *backend) Run(stopCh <-chan struct{}) error {
+	// spawn a goroutine that block on waiting for shutdown signal
+	// and will shutdown delegates upon receiving one and then exit.
 	go func() {
+		// Defer panic handling
+		defer utilruntime.HandleCrash()
+
+		// Start controller
+		if err := b.auditSinkControler.run(stopCh); err != nil {
+			return
+		}
+
 		<-stopCh
 		b.stopAllDelegates()
 	}()
@@ -232,94 +241,52 @@ func (b *backend) setDelegates(delegates syncedDelegates) {
 	b.delegates.Store(delegates)
 }
 
-// addSink is called by the shared informer when a sink is added
-func (b *backend) addSink(sink *auditregv1alpha1.AuditSink) {
+// unregisterAndStopDelegate removes the delegate for a sink
+// with this uid from the delegates list and invokes
+// non-blocking graceful shutdown on it
+func (b *backend) unregisterAndStopDelegate(uid types.UID) {
 	b.delegateUpdateMutex.Lock()
 	defer b.delegateUpdateMutex.Unlock()
 	delegates := b.copyDelegates()
-	if _, ok := delegates[sink.UID]; ok {
-		klog.Errorf("Audit sink %q uid: %s already exists, could not readd", sink.Name, sink.UID)
-		return
+	if d, ok := delegates[uid]; ok {
+		delete(delegates, uid)
+		b.setDelegates(delegates)
+		go d.gracefulShutdown()
+		klog.V(2).Infof("Removed audit sink: %s", d.configuration.Name)
+		klog.V(2).Infof("Current audit sinks: %v", delegates.Names())
 	}
+}
+
+// registerAndRunNewDelegate creates a new delegate for a sink
+// and updates the registry with it
+func (b *backend) registerAndRunNewDelegate(sink *auditregv1alpha1.AuditSink) error {
 	d, err := b.createAndStartDelegate(sink)
 	if err != nil {
-		msg := fmt.Sprintf("Could not add audit sink %q: %v", sink.Name, err)
-		klog.Error(msg)
-		b.recorder.Event(sink, corev1.EventTypeWarning, "CreateFailed", msg)
-		return
+		utilruntime.HandleError(fmt.Errorf("failed to create sink %s: %v", sink.Name, err))
+		b.recorder.Event(sink, corev1.EventTypeWarning, "CreateFailed", fmt.Sprintf("Could not create audit sink %s: %v", sink.Name, err))
+		return err
 	}
+	b.delegateUpdateMutex.Lock()
+	defer b.delegateUpdateMutex.Unlock()
+	delegates := b.copyDelegates()
 	delegates[sink.UID] = d
 	b.setDelegates(delegates)
 	klog.V(2).Infof("Added audit sink: %s", sink.Name)
 	klog.V(2).Infof("Current audit sinks: %v", delegates.Names())
+	return nil
 }
 
-// updateSink is called by the shared informer when a sink is updated.
-// The new sink is only rebuilt on spec changes. The new sink must not have
-// the same uid as the previous. The new sink will be started before the old
-// one is shutdown so no events will be lost
-func (b *backend) updateSink(oldSink, newSink *auditregv1alpha1.AuditSink) {
-	b.delegateUpdateMutex.Lock()
-	defer b.delegateUpdateMutex.Unlock()
-	delegates := b.copyDelegates()
-	oldDelegate, ok := delegates[oldSink.UID]
-	if !ok {
-		klog.Errorf("Could not update audit sink %q uid: %s, old sink does not exist",
-			oldSink.Name, oldSink.UID)
-		return
-	}
-
-	// check if spec has changed
-	eq := reflect.DeepEqual(oldSink.Spec, newSink.Spec)
-	if eq {
-		delete(delegates, oldSink.UID)
-		delegates[newSink.UID] = oldDelegate
-		b.setDelegates(delegates)
-	} else {
-		d, err := b.createAndStartDelegate(newSink)
-		if err != nil {
-			msg := fmt.Sprintf("Could not update audit sink %q: %v", oldSink.Name, err)
-			klog.Error(msg)
-			b.recorder.Event(newSink, corev1.EventTypeWarning, "UpdateFailed", msg)
-			return
-		}
-		delete(delegates, oldSink.UID)
-		delegates[newSink.UID] = d
-		b.setDelegates(delegates)
-
-		// graceful shutdown in goroutine as to not block
-		go oldDelegate.gracefulShutdown()
-	}
-
-	klog.V(2).Infof("Updated audit sink: %s", newSink.Name)
-	klog.V(2).Infof("Current audit sinks: %v", delegates.Names())
-}
-
-// deleteSink is called by the shared informer when a sink is deleted
-func (b *backend) deleteSink(sink *auditregv1alpha1.AuditSink) {
-	b.delegateUpdateMutex.Lock()
-	defer b.delegateUpdateMutex.Unlock()
-	delegates := b.copyDelegates()
-	delegate, ok := delegates[sink.UID]
-	if !ok {
-		klog.Errorf("Could not delete audit sink %q uid: %s, does not exist", sink.Name, sink.UID)
-		return
-	}
-	delete(delegates, sink.UID)
-	b.setDelegates(delegates)
-
-	// graceful shutdown in goroutine as to not block
-	go delegate.gracefulShutdown()
-	klog.V(2).Infof("Deleted audit sink: %s", sink.Name)
-	klog.V(2).Infof("Current audit sinks: %v", delegates.Names())
-}
-
-// createAndStartDelegate will build a delegate from an audit sink configuration and run it
+// createAndStartDelegate will build a delegate from an audit sink configuration and run it synchronously
 func (b *backend) createAndStartDelegate(sink *auditregv1alpha1.AuditSink) (*delegate, error) {
+	auditClasses, err := b.config.AuditClassInformer.Lister().List(labels.Everything())
+	if err != nil {
+		return nil, err
+	}
 	f := factory{
 		config:               b.config,
 		webhookClientManager: b.webhookClientManager,
 		sink:                 sink,
+		auditClasses:         auditClasses,
 	}
 	delegate, err := f.BuildDelegate()
 	if err != nil {
@@ -339,4 +306,272 @@ func (b *backend) String() string {
 		delegateStrings = append(delegateStrings, fmt.Sprintf("%s", delegate))
 	}
 	return fmt.Sprintf("%s[%s]", PluginName, strings.Join(delegateStrings, ","))
+}
+
+type runner interface {
+	run(stopCh <-chan struct{}) error
+}
+
+type auditSinkReconciler interface {
+	reconcile(key uidKey) error
+}
+
+type defaultAuditSinkControl struct {
+	delegateManager    delegateManager
+	auditSinks         auditlisters.AuditSinkLister
+	auditSinksSynced   cache.InformerSynced
+	auditClasses       auditlisters.AuditClassLister
+	auditClassesSynced cache.InformerSynced
+	workqueue          workqueue.RateLimitingInterface
+	workersCount       int
+	// exposed as struct property only for test injections
+	reconciler auditSinkReconciler
+}
+
+type uidKey struct {
+	uid  types.UID
+	name string
+}
+
+func sinkToKey(sink *auditregv1alpha1.AuditSink) (uidKey, error) {
+	key, err := cache.MetaNamespaceKeyFunc(sink)
+	return uidKey{
+		uid:  sink.GetUID(),
+		name: key,
+	}, err
+}
+
+// newAuditSinkControler constructs a new controller instance to handle AuditSink and AuditClass resource events
+func newAuditSinkControler(auditSinkInformer auditinformer.AuditSinkInformer,
+	auditClassInformer auditinformer.AuditClassInformer,
+	workersCount int,
+	delegateManager delegateManager) runner {
+	workqueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "AuditSinks")
+
+	d := &defaultAuditSinkControl{
+		delegateManager:    delegateManager,
+		auditSinks:         auditSinkInformer.Lister(),
+		auditSinksSynced:   auditSinkInformer.Informer().HasSynced,
+		auditClasses:       auditClassInformer.Lister(),
+		auditClassesSynced: auditClassInformer.Informer().HasSynced,
+		workqueue:          workqueue,
+		workersCount:       workersCount,
+	}
+
+	d.reconciler = d
+
+	auditSinkInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    d.enqueueSink,
+		UpdateFunc: d.updateSink,
+		DeleteFunc: d.deleteSink,
+	})
+
+	auditClassInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    d.onAuditClassEvent,
+		UpdateFunc: d.onAuditClassEventUpdate,
+		DeleteFunc: d.onAuditClassEvent,
+	})
+
+	return d
+}
+
+func (d *defaultAuditSinkControl) run(stopCh <-chan struct{}) error {
+	// Defer workqueue shutdown
+	defer d.workqueue.ShutDown()
+	// Defer panic handling
+	defer utilruntime.HandleCrash()
+	// Waiting for caches to sync for dynamic audit plugin
+	if !cache.WaitForCacheSync(stopCh, d.auditSinksSynced, d.auditClassesSynced) {
+		err := fmt.Errorf("unable to sync caches for dynamic audit plugin")
+		utilruntime.HandleError(err)
+		return err
+	}
+
+	//Starting workers
+	for i := 0; i < d.workersCount; i++ {
+		go wait.Until(d.runWorker, time.Second, stopCh)
+	}
+
+	<-stopCh
+
+	return nil
+}
+
+// enqueueSink is called by the shared informer when an AuditSink resource is added or updated,
+// or when a referenced AuditClass event occurs
+func (d *defaultAuditSinkControl) enqueueSink(newObj interface{}) {
+	sink, ok := newObj.(*auditregv1alpha1.AuditSink)
+	if !ok {
+		return
+	}
+	key, err := sinkToKey(sink)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("couldn't get cache key for AuditSink object: %v", err))
+		return
+	}
+	d.workqueue.Add(key)
+}
+
+// updateSink is called by the shared informer when an AuditSink is updated
+func (d *defaultAuditSinkControl) updateSink(oldObj, newObj interface{}) {
+	var (
+		oldSink = oldObj.(*auditregv1alpha1.AuditSink)
+		newSink = newObj.(*auditregv1alpha1.AuditSink)
+	)
+	// We want to make sure delegates are stopped ASAP. Finalizer changes are an update event and
+	// resource might be in delete state already here, before watcher has triggered delete event.
+	// Hence the check for `DeletionTimestamp` in this update handler.
+	if newSink.DeletionTimestamp != nil ||
+		!apiequality.Semantic.DeepEqual(oldSink.Spec, newSink.Spec) {
+		d.enqueueSink(newSink)
+		return
+	}
+}
+
+// deleteSink is called by the shared informer when an AuditSink is deleted
+func (d *defaultAuditSinkControl) deleteSink(obj interface{}) {
+	sink, ok := obj.(*auditregv1alpha1.AuditSink)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("error decoding object, invalid type %#v", obj))
+			return
+		}
+		if sink, ok = tombstone.Obj.(*auditregv1alpha1.AuditSink); !ok {
+			utilruntime.HandleError(fmt.Errorf("error decoding object tombstone, invalid type %#v", tombstone.Obj))
+			return
+		}
+	}
+
+	key, err := sinkToKey(sink)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("couldn't get cache key for AuditSink object: %v", err))
+		return
+	}
+
+	d.workqueue.Add(key)
+}
+
+// onAuditClassEvent is triggered by informer upon AuditClass
+// lifecycle events to find out affected sinks and have them enqued
+// for reconciliation
+func (d *defaultAuditSinkControl) onAuditClassEvent(obj interface{}) {
+	var (
+		class *auditregv1alpha1.AuditClass
+		ok    bool
+		sinks []*auditregv1alpha1.AuditSink
+		err   error
+	)
+	if class, ok = obj.(*auditregv1alpha1.AuditClass); !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("error decoding object, invalid type %#v", obj))
+			return
+		}
+		if class, ok = tombstone.Obj.(*auditregv1alpha1.AuditClass); !ok {
+			utilruntime.HandleError(fmt.Errorf("error decoding object tombstone, invalid type %#v", tombstone.Obj))
+			return
+		}
+	}
+	// list the latest info from API server for the AuditSink resources
+	if sinks, err = d.auditSinks.List(labels.Everything()); err != nil {
+		utilruntime.HandleError(fmt.Errorf("failed to list AuditSink resources: %v", err))
+	}
+	// Search for references to this class in the policy rules of the sinks
+	// and enque the sinks with positive hits for reconciliation
+	for _, sink := range sinks {
+		for _, rule := range sink.Spec.Policy.Rules {
+			if rule.WithAuditClass == class.GetName() {
+				d.enqueueSink(sink)
+				break
+			}
+		}
+	}
+}
+
+func (d *defaultAuditSinkControl) onAuditClassEventUpdate(oldObj, newObj interface{}) {
+	var (
+		oldClass = oldObj.(*auditregv1alpha1.AuditClass)
+		newClass = newObj.(*auditregv1alpha1.AuditClass)
+	)
+	if newClass.DeletionTimestamp != nil ||
+		!apiequality.Semantic.DeepEqual(oldClass.Spec, newClass.Spec) {
+		d.onAuditClassEvent(newClass)
+	}
+}
+
+// reconcile synchronizes the desired delegates state with the actual
+func (d *defaultAuditSinkControl) reconcile(key uidKey) error {
+
+	// Get the latest info from API server for the AuditSink resource with this name
+	sink, err := d.auditSinks.Get(key.name)
+	switch {
+	case errors.IsNotFound(err):
+		{
+			// auditsink absence in store means watcher caught the deletion.
+			// Shutdown and clear from registry
+			d.delegateManager.unregisterAndStopDelegate(key.uid)
+			return nil
+		}
+	case err != nil:
+		utilruntime.HandleError(fmt.Errorf("Unable to retrieve auditsink %v from store: %v", key.name, err))
+	default:
+		{
+			// if sink has been recreated too fast we may
+			// end up with key for a stale object
+			if sink.GetUID() != key.uid {
+				d.delegateManager.unregisterAndStopDelegate(key.uid)
+			}
+			if sink.DeletionTimestamp != nil {
+				// auditsink is being deleted. shutdown and clear the delegate from registry
+				d.delegateManager.unregisterAndStopDelegate(sink.UID)
+				return nil
+			}
+			// Create and start a new delegate for this sink UID
+			err = d.delegateManager.registerAndRunNewDelegate(sink)
+		}
+	}
+
+	return err
+}
+
+func (d *defaultAuditSinkControl) runWorker() {
+	for d.processNextWorkItem() {
+	}
+}
+
+// processNextWorkItem will read a single work item off the workqueue and
+// attempt to process it, by calling the `reconcile` function.
+// Errors returned by the reconcile function will cause the key used for the
+// faulty execution to be enqued for reconcilliation again (rate limited).
+func (d *defaultAuditSinkControl) processNextWorkItem() bool {
+	obj, shutdown := d.workqueue.Get()
+
+	if shutdown {
+		return false
+	}
+
+	err := func(obj interface{}) error {
+		defer d.workqueue.Done(obj)
+		var key uidKey
+		var ok bool
+		if key, ok = obj.(uidKey); !ok {
+			d.workqueue.Forget(obj)
+			utilruntime.HandleError(fmt.Errorf("expected type uidKey in workqueue but got %#v", obj))
+			return nil
+		}
+		if err := d.reconciler.reconcile(key); err != nil {
+			d.workqueue.AddRateLimited(key)
+			return fmt.Errorf("failed to reconcile '%s': %s, requeuing", key.name, err.Error())
+		}
+		d.workqueue.Forget(obj)
+		return nil
+	}(obj)
+
+	if err != nil {
+		utilruntime.HandleError(err)
+		return true
+	}
+
+	return true
 }

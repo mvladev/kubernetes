@@ -156,6 +156,9 @@ type AuditDynamicOptions struct {
 	// Configuration for batching backend. This is currently only used as an override
 	// for integration tests
 	BatchConfig *pluginbuffered.BatchConfig
+
+	// WorkersCount is the number of workque workers dynamically updating AuditSink delegates
+	WorkersCount int
 }
 
 func NewAuditOptions() *AuditOptions {
@@ -179,8 +182,9 @@ func NewAuditOptions() *AuditOptions {
 			GroupVersionString: "audit.k8s.io/v1",
 		},
 		DynamicOptions: AuditDynamicOptions{
-			Enabled:     false,
-			BatchConfig: plugindynamic.NewDefaultWebhookBatchConfig(),
+			Enabled:      false,
+			BatchConfig:  plugindynamic.NewDefaultWebhookBatchConfig(),
+			WorkersCount: 10,
 		},
 	}
 }
@@ -603,6 +607,7 @@ func (o *AuditWebhookOptions) newUntruncatedBackend() (audit.Backend, error) {
 func (o *AuditDynamicOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&o.Enabled, "audit-dynamic-configuration", o.Enabled,
 		"Enables dynamic audit configuration. This feature also requires the DynamicAuditing feature flag")
+	//TODO: should we expose also o.WorkersCount as a flag?
 }
 
 func (o *AuditDynamicOptions) enabled() bool {
@@ -613,6 +618,9 @@ func (o *AuditDynamicOptions) Validate() []error {
 	var allErrors []error
 	if o.Enabled && !utilfeature.DefaultFeatureGate.Enabled(features.DynamicAuditing) {
 		allErrors = append(allErrors, fmt.Errorf("--audit-dynamic-configuration set, but DynamicAuditing feature gate is not enabled"))
+	}
+	if o.WorkersCount <= 0 {
+		allErrors = append(allErrors, fmt.Errorf("invalid dynamic audit workers count %d, must be a positive number", o.WorkersCount))
 	}
 	return allErrors
 }
@@ -635,12 +643,14 @@ func (o *AuditDynamicOptions) newBackend(
 		webhookOptions = NewWebhookOptions()
 	}
 	checker := policy.NewDynamicChecker()
-	informer := informers.Auditregistration().V1alpha1().AuditSinks()
+	auditSinkInformer := informers.Auditregistration().V1alpha1().AuditSinks()
+	auditClassInformer := informers.Auditregistration().V1alpha1().AuditClasses()
 	eventSink := &v1core.EventSinkImpl{Interface: clientset.CoreV1().Events(processInfo.Namespace)}
 
 	dc := &plugindynamic.Config{
-		Informer:       informer,
-		BufferedConfig: o.BatchConfig,
+		AuditSinkInformer:  auditSinkInformer,
+		AuditClassInformer: auditClassInformer,
+		BufferedConfig:     o.BatchConfig,
 		EventConfig: plugindynamic.EventConfig{
 			Sink: eventSink,
 			Source: corev1.EventSource{
@@ -652,6 +662,7 @@ func (o *AuditDynamicOptions) newBackend(
 			AuthInfoResolverWrapper: webhookOptions.AuthInfoResolverWrapper,
 			ServiceResolver:         webhookOptions.ServiceResolver,
 		},
+		WorkersCount: o.WorkersCount,
 	}
 	backend, err := plugindynamic.NewBackend(dc)
 	if err != nil {

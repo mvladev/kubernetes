@@ -26,7 +26,7 @@ import (
 )
 
 func TestToDelegate(t *testing.T) {
-	config, _ := defaultTestConfig()
+	config := defaultTestConfig()
 	defaultPolicy := auditregv1alpha1.Policy{
 		Level: auditregv1alpha1.LevelMetadata,
 	}
@@ -89,7 +89,7 @@ func TestBuildWebhookBackend(t *testing.T) {
 	defaultPolicy := auditregv1alpha1.Policy{
 		Level: auditregv1alpha1.LevelMetadata,
 	}
-	config, _ := defaultTestConfig()
+	config := defaultTestConfig()
 	b, err := NewBackend(config)
 	require.NoError(t, err)
 	d := b.(*backend)
