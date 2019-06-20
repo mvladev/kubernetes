@@ -99,7 +99,7 @@ func validatePolicyRule(policyRule auditregistration.PolicyRule, fldPath *field.
 }
 
 // ValidateAuditClass validates the AuditClass
-func ValidateAuditClass(class auditregistration.AuditClass) field.ErrorList {
+func ValidateAuditClass(class *auditregistration.AuditClass) field.ErrorList {
 	var allErrs field.ErrorList
 	fldPath := field.NewPath("spec")
 	for _, requestSelector := range class.Spec.RequestSelectors {

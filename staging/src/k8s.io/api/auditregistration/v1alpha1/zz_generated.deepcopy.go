@@ -55,7 +55,7 @@ func (in *AuditClass) DeepCopyObject() runtime.Object {
 func (in *AuditClassList) DeepCopyInto(out *AuditClassList) {
 	*out = *in
 	out.TypeMeta = in.TypeMeta
-	out.ListMeta = in.ListMeta
+	in.ListMeta.DeepCopyInto(&out.ListMeta)
 	if in.Items != nil {
 		in, out := &in.Items, &out.Items
 		*out = make([]AuditClass, len(*in))

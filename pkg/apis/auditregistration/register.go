@@ -48,6 +48,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(SchemeGroupVersion,
 		&AuditSink{},
 		&AuditSinkList{},
+		&AuditClass{},
+		&AuditClassList{},
 	)
 	return nil
 }

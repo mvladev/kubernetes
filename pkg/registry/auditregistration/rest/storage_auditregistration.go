@@ -23,7 +23,8 @@ import (
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	serverstorage "k8s.io/apiserver/pkg/server/storage"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
-	auditstorage "k8s.io/kubernetes/pkg/registry/auditregistration/auditsink/storage"
+	auditclasssinkstorage "k8s.io/kubernetes/pkg/registry/auditregistration/auditclass/storage"
+	auditsinkstorage "k8s.io/kubernetes/pkg/registry/auditregistration/auditsink/storage"
 )
 
 // RESTStorageProvider is a REST storage provider for audit.k8s.io
@@ -41,8 +42,10 @@ func (p RESTStorageProvider) NewRESTStorage(apiResourceConfigSource serverstorag
 
 func (p RESTStorageProvider) v1alpha1Storage(apiResourceConfigSource serverstorage.APIResourceConfigSource, restOptionsGetter generic.RESTOptionsGetter) map[string]rest.Storage {
 	storage := map[string]rest.Storage{}
-	s := auditstorage.NewREST(restOptionsGetter)
-	storage["auditsinks"] = s
+	sinks := auditsinkstorage.NewREST(restOptionsGetter)
+	classes := auditclasssinkstorage.NewREST(restOptionsGetter)
+	storage["auditsinks"] = sinks
+	storage["auditclasses"] = classes
 
 	return storage
 }
